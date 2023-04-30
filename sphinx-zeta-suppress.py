@@ -7,6 +7,7 @@ __all__ = ()
 
 import abc
 import collections.abc
+import contextlib
 import importlib
 import inspect
 import logging
@@ -14,13 +15,15 @@ import pkgutil
 import re
 import warnings
 from itertools import filterfalse, tee
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypeVar
 
-from sphinx.util.logging import NAMESPACE, SphinxLoggerAdapter
+from sphinx.errors import ExtensionError
+from sphinx.util.logging import NAMESPACE, SphinxLoggerAdapter, getLogger
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Iterator
-    from typing import Any, Literal, TypeGuard, TypeVar
+    from types import ModuleType
+    from typing import Any, Literal, TypeGuard
 
     from sphinx.application import Sphinx
     from sphinx.config import Config
@@ -28,8 +31,10 @@ if TYPE_CHECKING:
 
     T = TypeVar('T')
 
-    #: Logging level type.
-    Level = TypeVar('Level', int, str)
+#: Logging level type.
+Level = TypeVar('Level', int, str)
+
+logger = getLogger(__name__)
 
 def _notnone(value):
     # type: (Any) -> TypeGuard[Literal[None]]
@@ -178,109 +183,187 @@ class SphinxSuppressRecord(SphinxSuppressLogger, SphinxSuppressPatterns):
             and SphinxSuppressPatterns.suppressed(self, record)
         )
 
-def _get_filters(config):
-    """
-    Get the default filter and the filters by logger's prefix.
+class _FiltersAdapter:
+    def __init__(self, config):
+        format_name = lambda name: f'{NAMESPACE}.{name}'
 
-    :param config: The current Sphinx configuration.
-    :type config: sphinx.config.Config
-    :return: The default filter and a list of filters by logger's prefix.
-    :rtype: tuple[SphinxSuppressFilter, dict[str, list[SphinxSuppressFilter]]]
-    """
+        filters_by_prefix = {}
+        for name, levels in config.zeta_suppress_loggers.items():
+            prefix = format_name(name)
+            suppressor = SphinxSuppressLogger(prefix, levels)
+            filters_by_prefix.setdefault(prefix, []).append(suppressor)
 
-    format_name = lambda name: f'{NAMESPACE}.{name}'
+        suppress_records = config.zeta_suppress_records
+        groups, patterns = _partition(_is_pattern_like, suppress_records)
+        for group in groups:  # type: tuple[str, ...]
+            prefix = format_name(group[0])
+            suppressor = SphinxSuppressRecord(prefix, True, group[1:])
+            filters_by_prefix.setdefault(prefix, []).append(suppressor)
 
-    filters_by_prefix = {}
-    for name, levels in config.zeta_suppress_loggers.items():
-        prefix = format_name(name)
-        suppressor = SphinxSuppressLogger(prefix, levels)
-        filters_by_prefix.setdefault(prefix, []).append(suppressor)
+        #: The filter to always add.
+        self._global_filter = SphinxSuppressPatterns(patterns)
+        #: The lists of filters to add, indexed by logger's prefix.
+        #:
+        #: The prefix always starts with :data:`sphinx.util.logging.NAMESPACE`,
+        #: followed by a dot.
+        self._filters_by_prefix = filters_by_prefix
 
-    suppress_records = config.zeta_suppress_records
-    groups, patterns = _partition(_is_pattern_like, suppress_records)
-    for group in groups:  # type: tuple[str, ...]
-        prefix = format_name(group[0])
-        suppressor = SphinxSuppressRecord(prefix, True, group[1:])
-        filters_by_prefix.setdefault(prefix, []).append(suppressor)
-    # default filter
-    default_filter = SphinxSuppressPatterns(patterns)
-    return default_filter, filters_by_prefix
+    def get_module_names(self):
+        # type: () -> collections.abc.Generator[str, None, None]
+        """
+        Yield the names of the modules that are expected to be altered.
 
-def _update_logger_in(module, default_filter, filters_by_prefix, _cache):
-    """Alter the Sphinx loggers accessible in *module*.
+        Note that the ``NAMESPACE + '.'`` prefix added by Sphinx is removed.
+        """
 
+        prefix_len = len(NAMESPACE) + 1
+        for logger_name in self._filters_by_prefix:
+            yield logger_name[prefix_len:]
+
+    def get_filters(self, name):
+        """Yield the filters to add for the given logger's name.
+
+        :param name: The logger's name.
+        :type name: str
+        :return: The list of filters to add.
+        :rtype: collections.abc.Generator[SphinxSuppressFilter, None, None]
+
+        .. note:: The caller is responsible for adding the filters once.
+        """
+
+        for prefix, filters in self._filters_by_prefix.items():
+            if name.startswith(prefix):
+                yield from filters
+        yield self._global_filter
+
+_CACHE_ATTR_NAME = '_zeta_suppress_cache'
+
+def _mark_module(app, module_name):
+    # type: (Sphinx, str) -> None
+    """Mark a module name as being altered."""
+    getattr(app, _CACHE_ATTR_NAME).add(module_name)
+
+def _skip_module(app, module_name):
+    # type: (Sphinx, str) -> bool
+    """Check whether a named module should be skipped or not."""
+    return (
+        module_name in app.config.zeta_suppress_protect
+        or module_name in getattr(app, _CACHE_ATTR_NAME)
+    )
+
+def _update_module(config, module, filters):
+    # type: (Config, ModuleType, _FiltersAdapter) -> None
+    """Update the module's loggers using the corresponding filters."""
+    adapters = inspect.getmembers(module, _is_sphinx_logger_adapter)
+    for _, adapter in adapters:
+        for f in filters.get_filters(adapter.logger.name):
+            # Since a logger may be imported from a non-marked module,
+            # we ensure that the filter is only added at most once.
+            if f not in adapter.logger.filters:
+                logger.debug('updating logger: %s', adapter.logger.name,
+                             type='sphinx-zeta-suppress', once=True)
+                adapter.logger.addFilter(f)
+
+@contextlib.contextmanager
+def _suppress_deprecation_warnings():
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', DeprecationWarning)
+        warnings.simplefilter('ignore', PendingDeprecationWarning)
+        yield
+
+def _setup_filters(app, module, filters):
+    """Alter the Sphinx loggers accessible in *module* and its submodules.
+
+    :param app: The current Sphinx application.
+    :type app: sphinx.application.Sphinx
     :param module: The module to alter.
     :type module: types.ModuleType
-    :param default_filter: The default filter.
-    :type default_filter: SphinxSuppressFilter
-    :param filters_by_prefix: List of filters indexed by logger's prefix.
-    :type filters_by_prefix: dict[str, list[SphinxSuppressFilter]]
-    :param _cache: Cache of module names that were already altered.
-    :type _cache: set[str]
+    :param filters: A filters configuration adapter.
+    :type filters: _FiltersAdapter
     """
 
-    if module.__name__ in _cache:
+    if _skip_module(app, module.__name__):
+        logger.debug('skipping module: %s', module.__name__,
+                     type='sphinx-zeta-suppress', once=True)
         return
 
-    _cache.add(module.__name__)
-    members = inspect.getmembers(module, _is_sphinx_logger_adapter)
-    for _, adapter in members:
-        for prefix, filters in filters_by_prefix.items():
-            if adapter.logger.name.startswith(prefix):
-                # a logger might be imported from a module
-                # that was not yet marked, so we only add
-                # the filter once
-                for f in filters:
-                    if f not in adapter.logger.filters:
-                        adapter.logger.addFilter(f)
-        if default_filter not in adapter.logger.filters:
-            adapter.logger.addFilter(default_filter)
+    _mark_module(app, module.__name__)
+    _update_module(app.config, module, filters)
+
+    if not hasattr(module, '__path__'):
+        return
+
+    # scan the submodules
+    mod_path, mod_prefix = module.__path__, module.__name__ + '.'
+    with _suppress_deprecation_warnings():
+        for mod_info in pkgutil.walk_packages(mod_path, mod_prefix):
+            if _skip_module(app, mod_info.name):
+                logger.debug('skipping module: %s', mod_info.name,
+                             type='sphinx-zeta-suppress', once=True)
+                continue
+
+            try:
+                submodule = importlib.import_module(mod_info.name)
+            except ImportError as err:
+                logger.warning('cannot import module: %s', mod_info.name,
+                               exc_info=err, type='sphinx-zeta-suppress')
+                continue
+
+            _mark_module(app, mod_info.name)
+            _update_module(app, submodule, filters)
+
+# event handlers
 
 def install_supress_handlers(app, config):
     # type: (Sphinx, Config) -> None
-    """Event handler for :confval:`config-inited`.
+    """Event handler for :event:`config-inited`.
 
-    This handler should have the lowest priority among :confval:`config-inited`
-    handlers. Sphinx loggers declared after :confval:`config-inited` is fired
-    will not be altered or recognized at runtime.
+    This handler is called twice, namely as the first and the last handlers
+    for :event:`config-inited` so that loggers emitting messages during the
+    initialization or loggers declared after :event:`config-inited` is fired
+    can be altered properly.
     """
 
-    default_filter, filters_by_prefix = _get_filters(config)
-    seen = set()
+    filters = _FiltersAdapter(config)
 
+    # scan the loaded extensions and alter them
     for extension in app.extensions.values():  # type: Extension
-        if extension.name in config.zeta_suppress_protect:
-            # skip the extension
-            continue
+        module = extension.module
+        _setup_filters(app, module, filters)
 
-        mod = extension.module
-        _update_logger_in(mod, default_filter, filters_by_prefix, seen)
-        if not hasattr(mod, '__path__'):
-            continue
-
-        # find the loggers declared in a submodule
-        mod_path, mod_prefix = mod.__path__, mod.__name__ + '.'
-        with warnings.catch_warnings():
-            warnings.simplefilter('ignore', DeprecationWarning)
-            warnings.simplefilter('ignore', PendingDeprecationWarning)
-            for mod_info in pkgutil.iter_modules(mod_path, mod_prefix):
-                if mod_info.name in config.zeta_suppress_protect:
-                    # skip the module
-                    continue
-
+    # scan modules and alter them directly
+    with _suppress_deprecation_warnings():
+        for mod_name in filters.get_module_names():  # type: str
+            if not _skip_module(app, mod_name):
                 try:
-                    mod = importlib.import_module(mod_info.name)
-                except ImportError:
-                    continue
-                _update_logger_in(mod, default_filter, filters_by_prefix, seen)
+                    module = importlib.import_module(mod_name)
+                except Exception as err:
+                    msg = f'cannot import module {mod_name!r}'
+                    raise ExtensionError(msg, err, __name__)
+
+                _setup_filters(app, module, filters)
+
+def _create_temporary_cache(app, config):
+    # type: (Sphinx, Config) -> None
+    """Create a temporary attribute to hold the altered modules."""
+    if not hasattr(app, _CACHE_ATTR_NAME):
+        setattr(app, _CACHE_ATTR_NAME, set())
+
+def _delete_temporary_cache(app, config):
+    # type: (Sphinx, Config) -> None
+    """Delete the temporary attribute holding the altered modules."""
+    if hasattr(app, _CACHE_ATTR_NAME):
+        delattr(app, _CACHE_ATTR_NAME)
 
 def setup(app):
     # type: (Sphinx) -> dict
     app.add_config_value('zeta_suppress_loggers', {}, True)
     app.add_config_value('zeta_suppress_protect', [], True)
     app.add_config_value('zeta_suppress_records', [], True)
-    # @contract: no logger is emitting a message before 'config-inited' is fired
+    app.connect('config-inited', _create_temporary_cache, priority=-1)
+    # @contract: no logger emits a message before 'config-inited' is fired
     app.connect('config-inited', install_supress_handlers, priority=0)
     # @contract: no extension is loaded after config-inited is fired
     app.connect('config-inited', install_supress_handlers, priority=1000)
+    app.connect('config-inited', _delete_temporary_cache, priority=1001)
     return {'parallel_read_safe': True, 'parallel_write_safe': True}
