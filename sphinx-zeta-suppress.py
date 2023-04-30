@@ -6,7 +6,6 @@ from __future__ import annotations
 __all__ = ()
 
 import abc
-import collections.abc
 import contextlib
 import importlib
 import inspect
@@ -21,7 +20,7 @@ from sphinx.errors import ExtensionError
 from sphinx.util.logging import NAMESPACE, SphinxLoggerAdapter, getLogger
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Iterator
+    from collections.abc import Callable, Generator, Iterable, Iterator
     from types import ModuleType
     from typing import Any, Literal, TypeGuard
 
@@ -37,7 +36,7 @@ Level = TypeVar('Level', int, str)
 logger = getLogger(__name__)
 
 def _notnone(value):
-    # type: (Any) -> TypeGuard[Literal[None]]
+    # type: (Any) -> bool
     return value is not None
 
 def _is_sphinx_logger_adapter(value):
@@ -83,9 +82,9 @@ def _normalize_level(level):
         raise TypeError(f'invalid logging level type for {level}')
 
 def _parse_levels(levels):
-    # type: (Level | collections.abc.Iterable[Level]) -> list[int]
+    # type: (Level | list[Level] | tuple[Level, ...]) -> list[int]
     """Convert one or more logging levels into a list of logging levels."""
-    if not isinstance(levels, collections.abc.Iterable):
+    if not isinstance(levels, (list, tuple)):
         if not isinstance(levels, (int, str)):
             raise TypeError('invalid logging level type')
         levels = [levels]
@@ -209,7 +208,7 @@ class _FiltersAdapter:
         self._filters_by_prefix = filters_by_prefix
 
     def get_module_names(self):
-        # type: () -> collections.abc.Generator[str, None, None]
+        # type: () -> Generator[str, None, None]
         """
         Yield the names of the modules that are expected to be altered.
 
