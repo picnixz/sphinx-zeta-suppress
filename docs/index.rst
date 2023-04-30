@@ -10,9 +10,10 @@ Recall that Sphinx automatically adds a ``sphinx.`` prerfix to the logger name
 if the logger adapter is created via :func:`sphinx.util.logging.getLogger`.
 
 In particular, Sphinx-related modules and third-party extensions are assumed
-to do the same. Use ``EXTENSION`` and not ``sphinx.EXTENSION`` to suppress
-the logger associated with the extension (e.g., ``sphinx.ext.intersphinx``
-to suppress the logger declared in the :mod:`sphinx.ext.intersphinx` module).
+to do the same. Use ``MODULE`` and not ``sphinx.MODULE`` to suppress the logger
+associated with the given module (e.g., ``sphinx.ext.intersphinx`` to suppress
+the logger declared in the :mod:`sphinx.ext.intersphinx` module). This supports
+suppressing loggers in Sphinx extensions or loggers in arbitrary modules.
 
 Typical usage::
 
