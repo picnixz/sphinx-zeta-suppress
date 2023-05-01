@@ -11,4 +11,4 @@ See https://sphinx-zeta-suppress.readthedocs.io/en/latest/
 
 ## License
 
-See [LICENSE.md](LICENSE.md)
+See [LICENSE](LICENSE)
